@@ -1,0 +1,19 @@
+.github-pr-success {
+    color: #2ea043;
+}
+
+.github-pr-failure {
+    color: #f85149;
+}
+
+.github-pr-pending {
+    color: #d29922;
+}
+
+.github-pr-error {
+    color: #f85149;
+}
+
+.github-pr-unknown {
+    color: #8b949e;
+}

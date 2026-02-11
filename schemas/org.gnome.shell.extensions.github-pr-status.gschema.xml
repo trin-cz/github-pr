@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.github-pr-status"
+          path="/org/gnome/shell/extensions/github-pr-status/">
+
+    <key name="github-token" type="s">
+      <default>''</default>
+      <summary>GitHub Personal Access Token</summary>
+      <description>A GitHub PAT with repo scope for querying PR and CI status via the GraphQL API.</description>
+    </key>
+
+    <key name="refresh-interval" type="i">
+      <default>300</default>
+      <summary>Refresh interval in seconds</summary>
+      <description>How often to poll GitHub for updated PR CI status (60–3600).</description>
+    </key>
+
+    <key name="notify-on-change" type="b">
+      <default>true</default>
+      <summary>Notify on status change</summary>
+      <description>Show a desktop notification when a PR's CI status changes.</description>
+    </key>
+
+  </schema>
+</schemalist>
