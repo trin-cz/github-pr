@@ -10,6 +10,7 @@ import * as PopupMenu from "resource:///org/gnome/shell/ui/popupMenu.js";
 
 const GRAPHQL_QUERY = `{
     viewer {
+        login
         pullRequests(first: 50, states: OPEN) {
             nodes {
                 title
@@ -19,10 +20,24 @@ const GRAPHQL_QUERY = `{
                 commits(last: 1) {
                     nodes {
                         commit {
+                            committedDate
                             statusCheckRollup {
                                 state
                             }
                         }
+                    }
+                }
+                reviews(last: 30) {
+                    nodes {
+                        createdAt
+                        state
+                        author { login }
+                    }
+                }
+                comments(last: 30) {
+                    nodes {
+                        createdAt
+                        author { login }
                     }
                 }
             }
@@ -68,8 +83,18 @@ export default class GitHubPRStatusExtension extends Extension {
       style_class: STYLE_MAP.unknown,
     });
 
+    this._conversationIcon = new St.Icon({
+      icon_name: "user-available-symbolic",
+      style_class: "system-status-icon github-pr-conversation",
+      visible: false,
+    });
+
+    const box = new St.BoxLayout({ style_class: "panel-status-indicators-box" });
+    box.add_child(this._icon);
+    box.add_child(this._conversationIcon);
+
     this._indicator = new PanelMenu.Button(0.0, this.metadata.name, false);
-    this._indicator.add_child(this._icon);
+    this._indicator.add_child(box);
     Main.panel.addToStatusArea(this.uuid, this._indicator);
 
     this._settingsHandlers = [
@@ -101,6 +126,7 @@ export default class GitHubPRStatusExtension extends Extension {
     this._indicator?.destroy();
     this._indicator = null;
     this._icon = null;
+    this._conversationIcon = null;
   }
 
   _startPolling() {
@@ -142,6 +168,7 @@ export default class GitHubPRStatusExtension extends Extension {
       this._notifyChanges(prs);
       const overallState = this._getOverallState(prs);
       this._updatePanelIcon(overallState);
+      this._updateConversationIcon(prs);
       this._buildMenu(prs, null);
     } catch (e) {
       if (!this._indicator) return;
@@ -200,6 +227,33 @@ export default class GitHubPRStatusExtension extends Extension {
     }
   }
 
+  _hasUnreadComments(pr, myLogin, lastCommit) {
+    const committedDate = lastCommit?.committedDate
+      ? new Date(lastCommit.committedDate).getTime()
+      : 0;
+
+    const myReviewDates = (pr.reviews?.nodes ?? [])
+      .filter((r) => r.state !== "PENDING" && r.author?.login === myLogin)
+      .map((r) => new Date(r.createdAt).getTime());
+    const myCommentDates = (pr.comments?.nodes ?? [])
+      .filter((c) => c.author?.login === myLogin)
+      .map((c) => new Date(c.createdAt).getTime());
+    const myLatestComment = Math.max(0, ...myReviewDates, ...myCommentDates);
+
+    const threshold = Math.max(committedDate, myLatestComment);
+
+    const otherReviewDates = (pr.reviews?.nodes ?? [])
+      .filter((r) => r.state !== "PENDING" && r.author?.login !== myLogin)
+      .map((r) => new Date(r.createdAt).getTime());
+    const otherCommentDates = (pr.comments?.nodes ?? [])
+      .filter((c) => c.author?.login !== myLogin)
+      .map((c) => new Date(c.createdAt).getTime());
+
+    return [...otherReviewDates, ...otherCommentDates].some(
+      (date) => date > threshold,
+    );
+  }
+
   async _fetchPRStatus(token) {
     const body = JSON.stringify({ query: GRAPHQL_QUERY });
     const message = Soup.Message.new("POST", "https://api.github.com/graphql");
@@ -229,14 +283,18 @@ export default class GitHubPRStatusExtension extends Extension {
     if (data.errors)
       throw new Error(data.errors.map((e) => e.message).join(", "));
 
+    const myLogin = data.data.viewer.login;
+
     return data.data.viewer.pullRequests.nodes.map((pr) => {
-      const rollup = pr.commits.nodes[0]?.commit?.statusCheckRollup;
+      const lastCommit = pr.commits.nodes[0]?.commit;
+      const rollup = lastCommit?.statusCheckRollup;
       return {
         title: pr.title,
         url: pr.url,
         number: pr.number,
         repo: pr.repository.nameWithOwner,
         ciState: rollup?.state ?? "UNKNOWN",
+        hasUnreadComments: this._hasUnreadComments(pr, myLogin, lastCommit),
       };
     });
   }
@@ -272,6 +330,12 @@ export default class GitHubPRStatusExtension extends Extension {
     this._icon.style_class = STYLE_MAP[state] ?? STYLE_MAP.unknown;
   }
 
+  _updateConversationIcon(prs) {
+    if (!this._conversationIcon) return;
+    this._conversationIcon.visible =
+      prs && prs.some((pr) => pr.hasUnreadComments);
+  }
+
   _buildMenu(prs, errorMessage) {
     const menu = this._indicator?.menu;
     if (!menu) return;
@@ -289,7 +353,8 @@ export default class GitHubPRStatusExtension extends Extension {
     } else {
       for (const pr of prs) {
         const icon = this._ciStateIcon(pr.ciState);
-        const label = `${pr.repo}#${pr.number}: ${pr.title}`;
+        const commentMarker = pr.hasUnreadComments ? "\u{1F4AC} " : "";
+        const label = `${commentMarker}${pr.repo}#${pr.number}: ${pr.title}`;
         const item = new PopupMenu.PopupImageMenuItem(label, icon);
 
         const ornament = item._icon;
