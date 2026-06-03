@@ -12,34 +12,57 @@ const GRAPHQL_QUERY = `{
     viewer {
         login
         pullRequests(first: 50, states: OPEN) {
-            nodes {
-                title
-                url
-                number
-                repository { nameWithOwner }
-                commits(last: 1) {
-                    nodes {
-                        commit {
-                            committedDate
-                            statusCheckRollup {
-                                state
-                            }
-                        }
-                    }
+            nodes { ...PullRequestFields }
+        }
+    }
+    requested: search(
+        query: "is:open is:pr review-requested:@me archived:false",
+        type: ISSUE,
+        first: 50
+    ) {
+        nodes { ... on PullRequest { ...PullRequestFields } }
+    }
+    reviewed: search(
+        query: "is:open is:pr reviewed-by:@me archived:false",
+        type: ISSUE,
+        first: 50
+    ) {
+        nodes { ... on PullRequest { ...PullRequestFields } }
+    }
+}
+
+fragment PullRequestFields on PullRequest {
+    title
+    url
+    number
+    author { login }
+    repository { nameWithOwner }
+    commits(last: 1) {
+        nodes {
+            commit {
+                statusCheckRollup {
+                    state
                 }
-                reviews(last: 30) {
-                    nodes {
-                        createdAt
-                        state
-                        author { login }
-                    }
-                }
-                comments(last: 30) {
-                    nodes {
-                        createdAt
-                        author { login }
-                    }
-                }
+            }
+        }
+    }
+    reviews(last: 30) {
+        nodes {
+            createdAt
+            state
+            author { login }
+        }
+    }
+    comments(last: 30) {
+        nodes {
+            createdAt
+            author { login }
+        }
+    }
+    reviewRequests(first: 20) {
+        nodes {
+            requestedReviewer {
+                ... on User { login }
             }
         }
     }
@@ -163,13 +186,14 @@ export default class GitHubPRStatusExtension extends Extension {
     }
 
     try {
-      const prs = await this._fetchPRStatus(token);
+      const sections = await this._fetchPRStatus(token);
       if (!this._indicator) return; // disabled while fetching
-      this._notifyChanges(prs);
-      const overallState = this._getOverallState(prs);
+      const all = [...sections.mine, ...sections.reviewRequested];
+      this._notifyChanges(all);
+      const overallState = this._getOverallState(all);
       this._updatePanelIcon(overallState);
-      this._updateConversationIcon(prs);
-      this._buildMenu(prs, null);
+      this._updateConversationIcon(all);
+      this._buildMenu(sections, null);
     } catch (e) {
       if (!this._indicator) return;
       console.error(`[GitHub PR Status] ${e.message}`);
@@ -227,20 +251,14 @@ export default class GitHubPRStatusExtension extends Extension {
     }
   }
 
-  _hasUnreadComments(pr, myLogin, lastCommit) {
-    const committedDate = lastCommit?.committedDate
-      ? new Date(lastCommit.committedDate).getTime()
-      : 0;
-
+  _hasUnreadComments(pr, myLogin) {
     const myReviewDates = (pr.reviews?.nodes ?? [])
       .filter((r) => r.state !== "PENDING" && r.author?.login === myLogin)
       .map((r) => new Date(r.createdAt).getTime());
     const myCommentDates = (pr.comments?.nodes ?? [])
       .filter((c) => c.author?.login === myLogin)
       .map((c) => new Date(c.createdAt).getTime());
-    const myLatestComment = Math.max(0, ...myReviewDates, ...myCommentDates);
-
-    const threshold = Math.max(committedDate, myLatestComment);
+    const threshold = Math.max(0, ...myReviewDates, ...myCommentDates);
 
     const otherReviewDates = (pr.reviews?.nodes ?? [])
       .filter((r) => r.state !== "PENDING" && r.author?.login !== myLogin)
@@ -285,18 +303,48 @@ export default class GitHubPRStatusExtension extends Extension {
 
     const myLogin = data.data.viewer.login;
 
-    return data.data.viewer.pullRequests.nodes.map((pr) => {
-      const lastCommit = pr.commits.nodes[0]?.commit;
-      const rollup = lastCommit?.statusCheckRollup;
+    const normalize = (pr, kind) => {
+      const rollup = pr.commits.nodes[0]?.commit?.statusCheckRollup;
       return {
+        kind,
         title: pr.title,
         url: pr.url,
         number: pr.number,
         repo: pr.repository.nameWithOwner,
+        author: pr.author?.login ?? "",
         ciState: rollup?.state ?? "UNKNOWN",
-        hasUnreadComments: this._hasUnreadComments(pr, myLogin, lastCommit),
+        hasUnreadComments: this._hasUnreadComments(pr, myLogin),
       };
-    });
+    };
+
+    const directlyRequested = (pr) =>
+      (pr.reviewRequests?.nodes ?? []).some(
+        (req) => req.requestedReviewer?.login === myLogin,
+      );
+
+    const mine = data.data.viewer.pullRequests.nodes.map((pr) =>
+      normalize(pr, "mine"),
+    );
+    const mineUrls = new Set(mine.map((pr) => pr.url));
+
+    // Keep a PR in the review list if I'm directly requested (not team-only)
+    // or if I've already submitted a review (it stays after the request clears).
+    const requestedNodes = (data.data.requested.nodes ?? []).filter(
+      (pr) => pr && pr.url && directlyRequested(pr),
+    );
+    const reviewedNodes = (data.data.reviewed.nodes ?? []).filter(
+      (pr) => pr && pr.url,
+    );
+
+    const seen = new Set(mineUrls);
+    const reviewRequested = [];
+    for (const pr of [...requestedNodes, ...reviewedNodes]) {
+      if (seen.has(pr.url)) continue;
+      seen.add(pr.url);
+      reviewRequested.push(normalize(pr, "review-requested"));
+    }
+
+    return { mine, reviewRequested };
   }
 
   _getOverallState(prs) {
@@ -336,7 +384,7 @@ export default class GitHubPRStatusExtension extends Extension {
       prs && prs.some((pr) => pr.hasUnreadComments);
   }
 
-  _buildMenu(prs, errorMessage) {
+  _buildMenu(sections, errorMessage) {
     const menu = this._indicator?.menu;
     if (!menu) return;
 
@@ -346,27 +394,26 @@ export default class GitHubPRStatusExtension extends Extension {
       menu.addMenuItem(
         new PopupMenu.PopupMenuItem(errorMessage, { reactive: false }),
       );
-    } else if (!prs || prs.length === 0) {
-      menu.addMenuItem(
-        new PopupMenu.PopupMenuItem("No open PRs", { reactive: false }),
-      );
     } else {
-      for (const pr of prs) {
-        const icon = this._ciStateIcon(pr.ciState);
-        const commentMarker = pr.hasUnreadComments ? "\u{1F4AC} " : "";
-        const label = `${commentMarker}${pr.repo}#${pr.number}: ${pr.title}`;
-        const item = new PopupMenu.PopupImageMenuItem(label, icon);
+      const mine = sections?.mine ?? [];
+      const reviewRequested = sections?.reviewRequested ?? [];
 
-        const ornament = item._icon;
-        if (ornament) {
-          const cls = this._ciStateStyle(pr.ciState);
-          if (cls) ornament.add_style_class_name(cls);
+      if (mine.length === 0 && reviewRequested.length === 0) {
+        menu.addMenuItem(
+          new PopupMenu.PopupMenuItem("No open PRs", { reactive: false }),
+        );
+      } else {
+        if (mine.length > 0) {
+          menu.addMenuItem(this._buildSectionHeader("My PRs"));
+          for (const pr of mine) menu.addMenuItem(this._buildPrMenuItem(pr));
         }
-
-        item.connect("activate", () => {
-          Gio.AppInfo.launch_default_for_uri(pr.url, null);
-        });
-        menu.addMenuItem(item);
+        if (reviewRequested.length > 0) {
+          if (mine.length > 0)
+            menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+          menu.addMenuItem(this._buildSectionHeader("Reviews Requested"));
+          for (const pr of reviewRequested)
+            menu.addMenuItem(this._buildPrMenuItem(pr));
+        }
       }
     }
 
@@ -379,6 +426,40 @@ export default class GitHubPRStatusExtension extends Extension {
     const settingsItem = new PopupMenu.PopupMenuItem("Settings");
     settingsItem.connect("activate", () => this.openPreferences());
     menu.addMenuItem(settingsItem);
+  }
+
+  _buildSectionHeader(text) {
+    const header = new PopupMenu.PopupMenuItem(text, { reactive: false });
+    header.label.add_style_class_name("github-pr-section-header");
+    return header;
+  }
+
+  _buildPrMenuItem(pr) {
+    const icon = this._ciStateIcon(pr.ciState);
+    const label =
+      pr.kind === "review-requested"
+        ? `${pr.repo}#${pr.number} (by ${pr.author}): ${pr.title}`
+        : `${pr.repo}#${pr.number}: ${pr.title}`;
+    const item = new PopupMenu.PopupImageMenuItem(label, icon);
+
+    const ornament = item._icon;
+    if (ornament) {
+      const cls = this._ciStateStyle(pr.ciState);
+      if (cls) ornament.add_style_class_name(cls);
+    }
+
+    if (pr.hasUnreadComments) {
+      const trailing = new St.Icon({
+        icon_name: "user-available-symbolic",
+        style_class: "popup-menu-icon github-pr-conversation",
+      });
+      item.add_child(trailing);
+    }
+
+    item.connect("activate", () => {
+      Gio.AppInfo.launch_default_for_uri(pr.url, null);
+    });
+    return item;
   }
 
   _ciStateIcon(state) {
