@@ -21,3 +21,26 @@
 .github-pr-conversation {
     color: #58a6ff;
 }
+
+.github-pr-status-slot {
+    min-width: 16px;
+    min-height: 16px;
+}
+
+.github-pr-row-button {
+    padding: 0 6px;
+    border-radius: 4px;
+}
+
+.github-pr-row-button:hover {
+    background-color: rgba(128, 128, 128, 0.2);
+}
+
+.github-pr-row-title {
+    padding: 0 6px;
+    border-radius: 4px;
+}
+
+.github-pr-row-title:hover {
+    background-color: rgba(128, 128, 128, 0.2);
+}

@@ -21,5 +21,11 @@
       <description>Show a desktop notification when a PR's CI status changes.</description>
     </key>
 
+    <key name="accepted-prs" type="s">
+      <default>'{}'</default>
+      <summary>Per-PR acceptance state</summary>
+      <description>JSON map of PR URL to {at, headOid}. Suppresses CI failures and unread comments for the accepted head commit until new activity (force-push, fresh failing check, or new comment) arrives.</description>
+    </key>
+
   </schema>
 </schemalist>

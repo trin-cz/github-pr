@@ -1,3 +1,4 @@
+import Clutter from "gi://Clutter";
 import GLib from "gi://GLib";
 import Gio from "gi://Gio";
 import St from "gi://St";
@@ -40,8 +41,15 @@ fragment PullRequestFields on PullRequest {
     commits(last: 1) {
         nodes {
             commit {
+                oid
                 statusCheckRollup {
                     state
+                    contexts(last: 50) {
+                        nodes {
+                            ... on CheckRun { completedAt }
+                            ... on StatusContext { createdAt }
+                        }
+                    }
                 }
             }
         }
@@ -94,6 +102,8 @@ export default class GitHubPRStatusExtension extends Extension {
       "ci-state.json",
     ]);
     this._previousStates = this._loadCache();
+    this._acceptedMap = this._loadAcceptedMap();
+    this._lastSections = null;
 
     Gio._promisify(
       Soup.Session.prototype,
@@ -144,6 +154,8 @@ export default class GitHubPRStatusExtension extends Extension {
     this._session = null;
     this._settings = null;
     this._previousStates = null;
+    this._acceptedMap = null;
+    this._lastSections = null;
     this._cachePath = null;
 
     this._indicator?.destroy();
@@ -189,6 +201,13 @@ export default class GitHubPRStatusExtension extends Extension {
       const sections = await this._fetchPRStatus(token);
       if (!this._indicator) return; // disabled while fetching
       const all = [...sections.mine, ...sections.reviewRequested];
+      const prunedMap = this._pruneAcceptedMap(this._acceptedMap, all);
+      if (prunedMap !== this._acceptedMap) {
+        this._acceptedMap = prunedMap;
+        this._saveAcceptedMap(this._acceptedMap);
+      }
+      this._applyAcceptedState(all);
+      this._lastSections = sections;
       this._notifyChanges(all);
       const overallState = this._getOverallState(all);
       this._updatePanelIcon(overallState);
@@ -251,14 +270,14 @@ export default class GitHubPRStatusExtension extends Extension {
     }
   }
 
-  _hasUnreadComments(pr, myLogin) {
+  _computeCommentSignals(pr, myLogin) {
     const myReviewDates = (pr.reviews?.nodes ?? [])
       .filter((r) => r.state !== "PENDING" && r.author?.login === myLogin)
       .map((r) => new Date(r.createdAt).getTime());
     const myCommentDates = (pr.comments?.nodes ?? [])
       .filter((c) => c.author?.login === myLogin)
       .map((c) => new Date(c.createdAt).getTime());
-    const threshold = Math.max(0, ...myReviewDates, ...myCommentDates);
+    const myReadThreshold = Math.max(0, ...myReviewDates, ...myCommentDates);
 
     const otherReviewDates = (pr.reviews?.nodes ?? [])
       .filter((r) => r.state !== "PENDING" && r.author?.login !== myLogin)
@@ -267,9 +286,22 @@ export default class GitHubPRStatusExtension extends Extension {
       .filter((c) => c.author?.login !== myLogin)
       .map((c) => new Date(c.createdAt).getTime());
 
-    return [...otherReviewDates, ...otherCommentDates].some(
-      (date) => date > threshold,
-    );
+    return {
+      myReadThreshold,
+      otherActivityDates: [...otherReviewDates, ...otherCommentDates],
+    };
+  }
+
+  _applyAcceptedState(prs) {
+    for (const pr of prs) {
+      const entry = this._acceptedMap?.[pr.url];
+      pr.accepted = entry ? { at: entry.at, headOid: entry.headOid } : null;
+      const threshold = Math.max(
+        pr.myReadThreshold,
+        pr.accepted?.at ?? 0,
+      );
+      pr.hasUnreadComments = pr.otherActivityDates.some((d) => d > threshold);
+    }
   }
 
   async _fetchPRStatus(token) {
@@ -304,7 +336,17 @@ export default class GitHubPRStatusExtension extends Extension {
     const myLogin = data.data.viewer.login;
 
     const normalize = (pr, kind) => {
-      const rollup = pr.commits.nodes[0]?.commit?.statusCheckRollup;
+      const commit = pr.commits.nodes[0]?.commit;
+      const rollup = commit?.statusCheckRollup;
+      const contextDates = (rollup?.contexts?.nodes ?? [])
+        .map((c) => c?.completedAt || c?.createdAt)
+        .filter(Boolean)
+        .map((d) => new Date(d).getTime());
+      const latestCheckAt = contextDates.length
+        ? Math.max(...contextDates)
+        : null;
+      const { myReadThreshold, otherActivityDates } =
+        this._computeCommentSignals(pr, myLogin);
       return {
         kind,
         title: pr.title,
@@ -313,7 +355,13 @@ export default class GitHubPRStatusExtension extends Extension {
         repo: pr.repository.nameWithOwner,
         author: pr.author?.login ?? "",
         ciState: rollup?.state ?? "UNKNOWN",
-        hasUnreadComments: this._hasUnreadComments(pr, myLogin),
+        headOid: commit?.oid ?? "",
+        latestCheckAt,
+        myReadThreshold,
+        otherActivityDates,
+        // Filled in by _applyAcceptedState before render.
+        accepted: null,
+        hasUnreadComments: false,
       };
     };
 
@@ -353,6 +401,7 @@ export default class GitHubPRStatusExtension extends Extension {
     let hasPending = false;
 
     for (const pr of prs) {
+      if (pr.accepted) continue;
       switch (pr.ciState) {
         case "FAILURE":
         case "ERROR":
@@ -435,31 +484,165 @@ export default class GitHubPRStatusExtension extends Extension {
   }
 
   _buildPrMenuItem(pr) {
-    const icon = this._ciStateIcon(pr.ciState);
-    const label =
+    const item = new PopupMenu.PopupBaseMenuItem({
+      reactive: false,
+      activate: false,
+      can_focus: false,
+    });
+
+    // Slot 1: CI status icon (always present).
+    const ciIcon = new St.Icon({
+      icon_name: this._ciStateIcon(pr.ciState),
+      style_class: "popup-menu-icon",
+    });
+    const ciCls = this._ciStateStyle(pr.ciState);
+    if (ciCls) ciIcon.add_style_class_name(ciCls);
+    item.add_child(this._buildStatusSlot(ciIcon));
+
+    // Slot 2: unread-conversation icon (when applicable).
+    const convIcon = pr.hasUnreadComments
+      ? new St.Icon({
+          icon_name: "user-available-symbolic",
+          style_class: "popup-menu-icon github-pr-conversation",
+        })
+      : null;
+    item.add_child(this._buildStatusSlot(convIcon));
+
+    // Button 1: accept / reset acceptance (mode-swap in place).
+    const isAccepted = !!pr.accepted;
+    const acceptBtn = new St.Button({
+      style_class: "github-pr-row-button",
+      can_focus: true,
+      track_hover: true,
+      accessible_name: isAccepted
+        ? "Reset acceptance"
+        : "Accept current status",
+    });
+    acceptBtn.set_child(
+      new St.Icon({
+        icon_name: isAccepted ? "edit-undo-symbolic" : "emblem-ok-symbolic",
+        style_class: "popup-menu-icon",
+      }),
+    );
+    acceptBtn.connect("clicked", () => {
+      this._indicator?.menu.close();
+      if (isAccepted) this._resetAcceptance(pr);
+      else this._acceptPr(pr);
+    });
+    item.add_child(acceptBtn);
+
+    // Button 2: title, expands to fill the row, opens the PR.
+    const labelText =
       pr.kind === "review-requested"
         ? `${pr.repo}#${pr.number} (by ${pr.author}): ${pr.title}`
         : `${pr.repo}#${pr.number}: ${pr.title}`;
-    const item = new PopupMenu.PopupImageMenuItem(label, icon);
-
-    const ornament = item._icon;
-    if (ornament) {
-      const cls = this._ciStateStyle(pr.ciState);
-      if (cls) ornament.add_style_class_name(cls);
-    }
-
-    if (pr.hasUnreadComments) {
-      const trailing = new St.Icon({
-        icon_name: "user-available-symbolic",
-        style_class: "popup-menu-icon github-pr-conversation",
-      });
-      item.add_child(trailing);
-    }
-
-    item.connect("activate", () => {
+    const titleLabel = new St.Label({
+      text: labelText,
+      x_expand: true,
+      x_align: Clutter.ActorAlign.START,
+      y_align: Clutter.ActorAlign.CENTER,
+    });
+    const titleBtn = new St.Button({
+      style_class: "github-pr-row-title",
+      can_focus: true,
+      track_hover: true,
+      x_expand: true,
+      x_align: Clutter.ActorAlign.FILL,
+      child: titleLabel,
+    });
+    titleBtn.connect("clicked", () => {
+      this._indicator?.menu.close();
       Gio.AppInfo.launch_default_for_uri(pr.url, null);
     });
+    item.add_child(titleBtn);
+
     return item;
+  }
+
+  _buildStatusSlot(iconOrNull) {
+    const slot = new St.Bin({ style_class: "github-pr-status-slot" });
+    if (iconOrNull) slot.set_child(iconOrNull);
+    return slot;
+  }
+
+  _loadAcceptedMap() {
+    try {
+      const raw = this._settings.get_string("accepted-prs") || "{}";
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) return obj;
+    } catch (_) {
+      // Corrupt JSON — start fresh.
+    }
+    return {};
+  }
+
+  _saveAcceptedMap(map) {
+    try {
+      this._settings.set_string("accepted-prs", JSON.stringify(map));
+    } catch (e) {
+      console.error(
+        `[GitHub PR Status] Failed to save acceptance map: ${e.message}`,
+      );
+    }
+  }
+
+  _pruneAcceptedMap(map, allPrs) {
+    if (!map) return {};
+    const byUrl = new Map(allPrs.map((pr) => [pr.url, pr]));
+    const next = {};
+    let changed = false;
+    for (const [url, entry] of Object.entries(map)) {
+      const pr = byUrl.get(url);
+      if (!pr) {
+        changed = true;
+        continue;
+      }
+      if (pr.headOid && entry.headOid !== pr.headOid) {
+        changed = true;
+        continue;
+      }
+      const isFailing = pr.ciState === "FAILURE" || pr.ciState === "ERROR";
+      if (
+        isFailing &&
+        pr.latestCheckAt != null &&
+        pr.latestCheckAt > entry.at
+      ) {
+        changed = true;
+        continue;
+      }
+      next[url] = entry;
+    }
+    return changed ? next : map;
+  }
+
+  _acceptPr(pr) {
+    this._acceptedMap = {
+      ...(this._acceptedMap ?? {}),
+      [pr.url]: { at: Date.now(), headOid: pr.headOid },
+    };
+    this._saveAcceptedMap(this._acceptedMap);
+    this._refreshDerivedAndRender();
+  }
+
+  _resetAcceptance(pr) {
+    if (!this._acceptedMap?.[pr.url]) return;
+    const next = { ...this._acceptedMap };
+    delete next[pr.url];
+    this._acceptedMap = next;
+    this._saveAcceptedMap(this._acceptedMap);
+    this._refreshDerivedAndRender();
+  }
+
+  _refreshDerivedAndRender() {
+    if (!this._lastSections || !this._indicator) return;
+    const all = [
+      ...this._lastSections.mine,
+      ...this._lastSections.reviewRequested,
+    ];
+    this._applyAcceptedState(all);
+    this._updatePanelIcon(this._getOverallState(all));
+    this._updateConversationIcon(all);
+    this._buildMenu(this._lastSections, null);
   }
 
   _ciStateIcon(state) {
